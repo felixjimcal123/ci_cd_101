@@ -1,0 +1,22 @@
+name: Tests xUnit
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+      - name: Instalar .NET 6
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+      - name: Restaurar dependencias
+        run: dotnet restore 03-app-dotnet/tests/App.Tests/App.Tests.csproj
+      - name: Ejecutar tests xUnit
+        run: dotnet test 03-app-dotnet/tests/App.Tests/App.Tests.csproj --no-restore --configuration Release
