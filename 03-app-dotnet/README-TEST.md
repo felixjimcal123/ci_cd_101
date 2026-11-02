@@ -1,15 +1,12 @@
-# API mínima + test xUnit
+# API y test xUnit
 
-Se conserva la aplicación ASP.NET Core MVC original y se añade una API mínima:
+La API respeta la estructura de controladores del proyecto MVC.
 
-- `GET /api/saludo` → HTTP 200 con el texto `Hola mundo`.
-- `tests/App.Tests/SaludoTests.cs` → test de integración con xUnit y WebApplicationFactory.
+- `Controllers/SaludoController.cs`: endpoint `GET /api/saludo` que devuelve `Hola mundo`.
+- `tests/App.Tests/SaludoTests.cs`: test xUnit que verifica HTTP 200 y el texto de respuesta.
+- `.github/workflows/tests.yml`: ejecuta el test automáticamente al abrir o actualizar una Pull Request.
 
-## Requisitos
-
-SDK de .NET 6 (o SDK compatible con compilación para net6.0 y runtime ASP.NET Core 6). Se necesita acceso a NuGet para restaurar paquetes la primera vez. .NET 6 ya no tiene soporte oficial.
-
-## Ejecutar el test
+## Ejecutar tests
 
 Desde la carpeta `03-app-dotnet`:
 
@@ -17,12 +14,12 @@ Desde la carpeta `03-app-dotnet`:
 dotnet test tests/App.Tests/App.Tests.csproj
 ```
 
-## Ejecutar la aplicación
+## Probar la API
 
 ```bash
 dotnet run
 ```
 
-Abre la URL indicada por el servidor y añade `/api/saludo`.
+Visita `http://localhost:PUERTO/api/saludo` con el puerto HTTP mostrado en consola.
 
-El test usa un servidor de pruebas en memoria, sin iniciar la aplicación manualmente.
+Nota: esta implementación usa un controlador Web API, coherente con la estructura MVC existente, en lugar de Minimal API mediante `MapGet`.
