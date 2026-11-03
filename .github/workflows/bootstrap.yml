@@ -3,29 +3,146 @@ name: Azure Bootstrap
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Bootstrap operation"
+        required: true
+        type: choice
+        default: verify
+        options:
+          - verify
+          - create
 
 permissions:
   contents: read
   id-token: write
 
+env:
+  RESOURCE_GROUP: rg-rindus-tfstate
+  STORAGE_ACCOUNT: strindustfedbb8fbb
+  STORAGE_CONTAINER: tfstate
+  STORAGE_LOCATION: northeurope
+
+concurrency:
+  group: azure-bootstrap-tfstate
+  cancel-in-progress: false
+
 jobs:
-  verify:
-    name: Verify Azure bootstrap
+  bootstrap:
+    name: Bootstrap (${{ inputs.mode }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Login to Azure with OIDC
         uses: azure/login@v2
         with:
-          client-id: b65d15f8-013f-44bc-b6e7-7496f438d55c
-          tenant-id: 9cf44897-4a11-44b4-9d6a-e96e5ce78034
-          subscription-id: ece1eb3a-d7e4-4691-a1ee-f88ed7111f23
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Verify resource group
-        run: az group show --name rg-rindus-tfstate --query "{name:name,state:properties.provisioningState}" -o table
+        shell: bash
+        run: |
+          set -euo pipefail
+          az group show --name "$RESOURCE_GROUP" --output none
+          echo "Resource group exists: $RESOURCE_GROUP"
 
-      - name: Verify storage account
-        run: az storage account show --name strindustfedbb8fbb --resource-group rg-rindus-tfstate --query "{name:name,location:location,state:provisioningState,sharedKey:allowSharedKeyAccess,publicBlobs:allowBlobPublicAccess}" -o table
+      - name: Create storage account if missing
+        if: inputs.mode == 'create'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if az storage account show --name "$STORAGE_ACCOUNT" --resource-group "$RESOURCE_GROUP" --output none 2>/dev/null; then
+            echo "Storage account already exists. No changes."
+          else
+            echo "Checking whether storage account name is available..."
+
+            AVAILABLE=$(az storage account check-name --name "$STORAGE_ACCOUNT" --query nameAvailable -o tsv)
+
+            if [ "$AVAILABLE" != "true" ]; then
+              echo "::error::Storage account name is unavailable or the account cannot be accessed."
+              exit 1
+            fi
+
+            echo "Creating storage account..."
+
+            az storage account create \
+              --name "$STORAGE_ACCOUNT" \
+              --resource-group "$RESOURCE_GROUP" \
+              --location "$STORAGE_LOCATION" \
+              --sku Standard_LRS \
+              --kind StorageV2 \
+              --allow-blob-public-access false \
+              --allow-shared-key-access false \
+              --min-tls-version TLS1_2 \
+              --https-only true \
+              --output none
+          fi
+
+      - name: Create state container if missing
+        if: inputs.mode == 'create'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXISTS=$(az storage container-rm exists --storage-account "$STORAGE_ACCOUNT" --resource-group "$RESOURCE_GROUP" --name "$STORAGE_CONTAINER" --query exists -o tsv)
+
+          if [ "$EXISTS" = "true" ]; then
+            echo "State container already exists. No changes."
+          elif [ "$EXISTS" = "false" ]; then
+            echo "Creating state container..."
+
+            az storage container-rm create \
+              --storage-account "$STORAGE_ACCOUNT" \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$STORAGE_CONTAINER" \
+              --public-access off \
+              --output none
+          else
+            echo "::error::Could not determine whether state container exists."
+            exit 1
+          fi
+
+      - name: Verify storage account security
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az storage account show \
+            --name "$STORAGE_ACCOUNT" \
+            --resource-group "$RESOURCE_GROUP" \
+            --output json > storage.json
+
+          jq -e --arg location "$STORAGE_LOCATION" '
+            .location == $location
+            and .sku.name == "Standard_LRS"
+            and .kind == "StorageV2"
+            and .allowBlobPublicAccess == false
+            and .allowSharedKeyAccess == false
+            and .minimumTlsVersion == "TLS1_2"
+            and .enableHttpsTrafficOnly == true
+            and .provisioningState == "Succeeded"
+          ' storage.json > /dev/null
+
+          echo "Storage account security verified."
 
       - name: Verify state container
-        run: az storage container-rm show --storage-account strindustfedbb8fbb --resource-group rg-rindus-tfstate --name tfstate --query "{name:name,publicAccess:properties.publicAccess}" -o json
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az storage container-rm show \
+            --storage-account "$STORAGE_ACCOUNT" \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$STORAGE_CONTAINER" \
+            --output json > container.json
+
+          jq -e '
+            .properties.publicAccess == null
+            or .properties.publicAccess == "None"
+          ' container.json > /dev/null
+
+          echo "State container verified."
+          echo "Bootstrap verification passed."
