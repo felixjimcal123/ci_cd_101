@@ -1,12 +1,12 @@
 # =============================================================================
-# RINDUS ROAD | Misión 01 | Terraform: inicializar backend remoto con OIDC
+# RINDUS ROAD | Misión 01 | Terraform: revisar plan con OIDC
 # =============================================================================
 # OBJETIVO
-#   Demostrar que Terraform puede usar Azure Blob Storage como backend remoto
+#   Validar infraestructura de aplicación mediante terraform plan,
 #   autenticándose con GitHub OIDC + Microsoft Entra ID (sin Shared Keys).
 #
 # ALCANCE DE ESTA PRÁCTICA
-#   SOLO terraform init: no ejecuta plan, apply ni destroy.
+#   terraform init + validate + plan; NO ejecuta apply ni destroy.
 #   No crea el Resource Group, Storage Account ni contenedor: bootstrap.yml
 #   ya ha verificado que existen y que la identidad tiene acceso a los blobs.
 #   init puede descargar proveedores y preparar metadatos del backend.
@@ -20,9 +20,9 @@
 #       backend "azurerm" {}
 # =============================================================================
 
-name: Terraform Backend Init
+name: Terraform Plan (OIDC)
 
-# Manual y explícito: no inicializamos ni tocamos estado en cada push.
+# Manual y explícito: no planificamos en cada push.
 on:
   workflow_dispatch:
 
@@ -42,6 +42,11 @@ env:
   ARM_USE_AZUREAD: 'true'
   ARM_USE_OIDC: 'true'
 
+  # Terraform recibe variables TF_VAR_* automáticamente.
+  TF_VAR_resource_group_name: rg-rindus-app-dev
+  TF_VAR_container_image: ${{ vars.TF_CONTAINER_IMAGE }}
+  TF_IN_AUTOMATION: 'true'
+
   # Backend remoto creado y comprobado por Azure Bootstrap.
   TF_BACKEND_RG: rg-rindus-tfstate
   TF_BACKEND_ACCOUNT: strindustfedbb8fbb
@@ -56,7 +61,7 @@ concurrency:
 
 jobs:
   init:
-    name: Initialize remote state (OIDC)
+    name: Review Terraform plan (OIDC)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -111,3 +116,24 @@ jobs:
           jq -e --arg key "$TF_BACKEND_KEY" '.backend.type == "azurerm" and .backend.config.key == $key' .terraform/terraform.tfstate > /dev/null
           echo "Backend metadata verified: azurerm / $TF_BACKEND_KEY"
           echo "NOTE: init does not prove that application infrastructure can be deployed."
+
+      # 7. Verificar inputs y sintaxis antes de consultar Azure.
+      #    La imagen debe ser la referencia GHCR real, no una inventada.
+      - name: Validate Terraform inputs and configuration
+        run: |
+          set -euo pipefail
+          if [[ -z "$TF_VAR_container_image" || "$TF_VAR_container_image" != ghcr.io/* ]]; then
+            echo "::error::Configura la variable de repositorio TF_CONTAINER_IMAGE con la imagen GHCR real (preferiblemente por digest)."
+            exit 1
+          fi
+          terraform validate -no-color
+
+      # 8. Plan exclusivamente: no crea, modifica ni destruye recursos.
+      #    -lock-timeout evita fallos por bloqueos transitorios.
+      #    -out conserva el plan solo en este runner; NO se sube como artifact.
+      - name: Plan application infrastructure (no apply)
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -no-color -lock-timeout=2m -out=tfplan
+          terraform show -no-color tfplan
+          echo "Terraform plan completed. No apply executed."
