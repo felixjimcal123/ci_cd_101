@@ -6,7 +6,7 @@ variable "resource_group_name" {
 variable "location" {
   description = "Region Azure para la infraestructura de la app."
   type        = string
-  default     = "westeurope"
+  default     = "northeurope"
 }
 
 variable "name_prefix" {
