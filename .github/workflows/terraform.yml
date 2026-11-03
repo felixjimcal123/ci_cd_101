@@ -1,12 +1,13 @@
 # =============================================================================
-# RINDUS ROAD | Misión 01 | Terraform: revisar plan con OIDC
+# RINDUS ROAD | Misión 01 | Terraform: plan y apply manual con OIDC
 # =============================================================================
 # OBJETIVO
 #   Validar infraestructura de aplicación mediante terraform plan,
 #   autenticándose con GitHub OIDC + Microsoft Entra ID (sin Shared Keys).
 #
 # ALCANCE DE ESTA PRÁCTICA
-#   terraform init + validate + plan; NO ejecuta apply ni destroy.
+#   plan: init + validate + plan (sin cambios en Azure).
+#   apply: plan + apply del mismo archivo + smoke test HTTP.
 #   No crea el Resource Group, Storage Account ni contenedor: bootstrap.yml
 #   ya ha verificado que existen y que la identidad tiene acceso a los blobs.
 #   init puede descargar proveedores y preparar metadatos del backend.
@@ -20,11 +21,20 @@
 #       backend "azurerm" {}
 # =============================================================================
 
-name: Terraform Plan (OIDC)
+name: Terraform Plan / Apply (OIDC)
 
-# Manual y explícito: no planificamos en cada push.
+# Manual y explícito: no planificamos ni desplegamos en cada push.
 on:
   workflow_dispatch:
+    inputs:
+      operation:
+        description: "plan = solo revisión; apply = despliegue con aprobación del entorno"
+        type: choice
+        required: true
+        default: plan
+        options:
+          - plan
+          - apply
 
 # contents: read permite checkout; id-token: write permite emitir OIDC.
 # Son permisos de GitHub, NO sustituyen a Azure RBAC.
@@ -61,7 +71,10 @@ concurrency:
 
 jobs:
   init:
-    name: Review Terraform plan (OIDC)
+    name: Terraform ${{ inputs.operation }} (OIDC)
+    # Para apply, GitHub exige aprobación SI se configuran reviewers en este entorno.
+    # La protección NO se activa por el simple hecho de declarar environment.
+    environment: ${{ inputs.operation == 'apply' && 'rindus-dev-deploy' || 'rindus-dev-plan' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -128,12 +141,44 @@ jobs:
           fi
           terraform validate -no-color
 
-      # 8. Plan exclusivamente: no crea, modifica ni destruye recursos.
+      # 8. Plan para ambas operaciones: revisión previa y archivo binario para apply.
       #    -lock-timeout evita fallos por bloqueos transitorios.
       #    -out conserva el plan solo en este runner; NO se sube como artifact.
-      - name: Plan application infrastructure (no apply)
+      - name: Plan application infrastructure
         run: |
           set -euo pipefail
           terraform plan -input=false -no-color -lock-timeout=2m -out=tfplan
           terraform show -no-color tfplan
-          echo "Terraform plan completed. No apply executed."
+          echo "Terraform plan completed. Operation requested: ${{ inputs.operation }}"
+
+      # 9. Solo en apply: ejecutar EXACTAMENTE el plan generado en este job.
+      #    El entorno rindus-dev-deploy debe tener Required reviewers configurados
+      #    en Settings > Environments; sin esa configuración NO hay aprobación.
+      #    No subimos tfplan como artifact: puede contener datos sensibles.
+      - name: Apply reviewed plan (manual and protected)
+        if: inputs.operation == 'apply'
+        run: |
+          set -euo pipefail
+          terraform apply -input=false -no-color -lock-timeout=2m tfplan
+          echo "Terraform apply completed."
+
+      # 10. Smoke test mínimo: comprobar respuesta HTTP 2xx/3xx desde la URL
+      #     pública generada por Terraform. La ruta / podría no existir en la API;
+      #     si devuelve 404, habrá que usar un endpoint real (p.ej. /health).
+      #     Esto NO sustituye pruebas funcionales ni verifica el contrato de API.
+      - name: Smoke test public API URL
+        if: inputs.operation == 'apply'
+        run: |
+          set -euo pipefail
+          API_URL="$(terraform output -raw api_url)"
+          echo "Testing $API_URL"
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error --location --max-time 15 --output /dev/null "$API_URL"; then
+              echo "Smoke test passed: HTTP 2xx/3xx"
+              exit 0
+            fi
+            echo "Attempt $attempt/12 failed; waiting 10s..."
+            sleep 10
+          done
+          echo "::error::Smoke test failed. Check container logs, startup and actual API route."
+          exit 1
