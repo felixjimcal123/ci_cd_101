@@ -1,0 +1,113 @@
+# =============================================================================
+# RINDUS ROAD | Misión 01 | Terraform: inicializar backend remoto con OIDC
+# =============================================================================
+# OBJETIVO
+#   Demostrar que Terraform puede usar Azure Blob Storage como backend remoto
+#   autenticándose con GitHub OIDC + Microsoft Entra ID (sin Shared Keys).
+#
+# ALCANCE DE ESTA PRÁCTICA
+#   SOLO terraform init: no ejecuta plan, apply ni destroy.
+#   No crea el Resource Group, Storage Account ni contenedor: bootstrap.yml
+#   ya ha verificado que existen y que la identidad tiene acceso a los blobs.
+#   init puede descargar proveedores y preparar metadatos del backend.
+#
+# PRECONDICIONES
+#   - Ejecutar desde main: la credencial federada existente está ligada a main.
+#   - Variables de repositorio: AZURE_CLIENT_ID, AZURE_TENANT_ID,
+#     AZURE_SUBSCRIPTION_ID.
+#   - Rol Storage Blob Data Contributor sobre el contenedor tfstate.
+#   - Terraform declarado en initial_lab/infra/versions.tf:
+#       backend "azurerm" {}
+# =============================================================================
+
+name: Terraform Backend Init
+
+# Manual y explícito: no inicializamos ni tocamos estado en cada push.
+on:
+  workflow_dispatch:
+
+# contents: read permite checkout; id-token: write permite emitir OIDC.
+# Son permisos de GitHub, NO sustituyen a Azure RBAC.
+permissions:
+  contents: read
+  id-token: write
+
+# Variables ARM_* reconocidas por el backend azurerm de Terraform.
+# ARM_USE_AZUREAD y ARM_USE_OIDC fuerzan la ruta Entra ID + OIDC.
+# Los identificadores no son secretos; no hay contraseña ni client secret.
+env:
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_AZUREAD: 'true'
+  ARM_USE_OIDC: 'true'
+
+  # Backend remoto creado y comprobado por Azure Bootstrap.
+  TF_BACKEND_RG: rg-rindus-tfstate
+  TF_BACKEND_ACCOUNT: strindustfedbb8fbb
+  TF_BACKEND_CONTAINER: tfstate
+  TF_BACKEND_KEY: dev.tfstate
+
+# Evita inicializaciones simultáneas de este workflow.
+# No reemplaza al bloqueo de estado que Terraform utiliza al operar.
+concurrency:
+  group: terraform-backend-dev
+  cancel-in-progress: false
+
+jobs:
+  init:
+    name: Initialize remote state (OIDC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Todos los comandos Terraform se ejecutan desde el módulo raíz real.
+    defaults:
+      run:
+        shell: bash
+        working-directory: initial_lab/infra
+
+    steps:
+      # 1. Descargar el repositorio, incluido el backend "azurerm" {}.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Obtener credenciales Azure efímeras por federación OIDC.
+      #    El mismo Service Principal ya superó las pruebas de bootstrap.
+      - name: Login to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # 3. Instalar Terraform compatible con required_version del proyecto.
+      #    No ejecutar init desde una versión anterior a 1.10.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.10.5'
+          terraform_wrapper: false
+
+      # 4. Comprobar la versión utilizada (evidencia en logs).
+      - name: Show Terraform version
+        run: terraform version
+
+      # 5. Configurar el backend remoto sin modificar versions.tf.
+      #    -input=false: no solicitar interacción en un runner desatendido.
+      #    -reconfigure: utilizar estos parámetros, sin intentar migrar estado.
+      #    NO usar -migrate-state ni -force-copy en esta práctica.
+      - name: Initialize AzureRM backend using Entra ID and OIDC
+        run: |
+          set -euo pipefail
+          terraform init -input=false -reconfigure -backend-config="resource_group_name=$TF_BACKEND_RG" -backend-config="storage_account_name=$TF_BACKEND_ACCOUNT" -backend-config="container_name=$TF_BACKEND_CONTAINER" -backend-config="key=$TF_BACKEND_KEY"
+          echo "Terraform backend initialization completed."
+
+      # 6. Validar que Terraform dejó configurado el backend esperado.
+      #    NO imprimimos ni subimos archivos de estado o credenciales.
+      - name: Verify backend metadata
+        run: |
+          set -euo pipefail
+          test -f .terraform/terraform.tfstate
+          jq -e --arg key "$TF_BACKEND_KEY" '.backend.type == "azurerm" and .backend.config.key == $key' .terraform/terraform.tfstate > /dev/null
+          echo "Backend metadata verified: azurerm / $TF_BACKEND_KEY"
+          echo "NOTE: init does not prove that application infrastructure can be deployed."
