@@ -1,11 +1,34 @@
+# ============================================================================
+# RINDUS ROAD | Misión 01 | Azure Bootstrap del backend de Terraform
+# ============================================================================
+# OBJETIVO
+#   Preparar (opcionalmente) y verificar el almacenamiento del estado remoto.
+#
+# MODOS (ejecución manual desde GitHub Actions)
+#   verify [por defecto]: SOLO comprueba; no crea ni modifica recursos.
+#   create               : crea Storage Account/contenedor SOLO si faltan.
+#
+# AUTENTICACIÓN Y SEGURIDAD
+#   GitHub OIDC -> Microsoft Entra ID -> Azure; sin client secrets ni Shared Keys.
+#   La identidad debe tener permisos de lectura de recursos y, para los blobs,
+#   Storage Blob Data Contributor sobre el contenedor tfstate.
+#   La asignación inicial de RBAC se realiza fuera de esta pipeline: aquí
+#   verificamos permisos, NO nos concedemos permisos a nosotros mismos.
+#
+# LÍMITES
+#   El Resource Group debe existir previamente.
+#   No se ejecuta terraform init/plan/apply en este workflow.
+#   Nunca se elimina el backend ni se sustituye un recurso existente.
+# ============================================================================
 
 name: Azure Bootstrap
 
+# Solo ejecución manual: evita crear recursos accidentalmente en cada push.
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Bootstrap operation"
+        description: "verify = solo comprobar; create = crear recursos ausentes"
         required: true
         type: choice
         default: verify
@@ -13,16 +36,25 @@ on:
           - verify
           - create
 
+# contents: read -> permiso mínimo de repositorio para el workflow.
+# id-token: write -> permite solicitar el token OIDC de GitHub.
+# No concede permisos Azure: estos se gestionan con Azure RBAC.
 permissions:
   contents: read
   id-token: write
 
+# Identificadores del backend compartidos por todos los pasos.
+# AZURE_CLIENT_ID / TENANT_ID / SUBSCRIPTION_ID son VARIABLES de GitHub,
+# no secretos; el login usa un token OIDC efímero.
 env:
   RESOURCE_GROUP: rg-rindus-tfstate
   STORAGE_ACCOUNT: strindustfedbb8fbb
   STORAGE_CONTAINER: tfstate
   STORAGE_LOCATION: northeurope
+  AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
 
+# Impide dos ejecuciones simultáneas que intenten preparar el mismo backend.
+# cancel-in-progress: false -> no interrumpimos una operación de creación.
 concurrency:
   group: azure-bootstrap-tfstate
   cancel-in-progress: false
@@ -34,6 +66,8 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # 1. Identidad: GitHub obtiene un token OIDC para el Service Principal.
+      #    El subject federado debe permitir la rama/contexto de esta ejecución.
       - name: Login to Azure with OIDC
         uses: azure/login@v2
         with:
@@ -41,6 +75,7 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      # 2. Precondición: este workflow NO crea el Resource Group.
       - name: Verify resource group
         shell: bash
         run: |
@@ -48,6 +83,10 @@ jobs:
           az group show --name "$RESOURCE_GROUP" --output none
           echo "Resource group exists: $RESOURCE_GROUP"
 
+      # 3. Solo modo create: crear la cuenta si no existe.
+      #    Configuración segura desde el primer momento: HTTPS, TLS 1.2,
+      #    sin acceso anónimo a blobs y sin autenticación por Shared Key.
+      #    Si existe, no se recrea ni se modifica aquí.
       - name: Create storage account if missing
         if: inputs.mode == 'create'
         shell: bash
@@ -58,7 +97,6 @@ jobs:
             echo "Storage account already exists. No changes."
           else
             echo "Checking whether storage account name is available..."
-
             AVAILABLE=$(az storage account check-name --name "$STORAGE_ACCOUNT" --query nameAvailable -o tsv)
 
             if [ "$AVAILABLE" != "true" ]; then
@@ -67,7 +105,6 @@ jobs:
             fi
 
             echo "Creating storage account..."
-
             az storage account create \
               --name "$STORAGE_ACCOUNT" \
               --resource-group "$RESOURCE_GROUP" \
@@ -81,6 +118,9 @@ jobs:
               --output none
           fi
 
+      # 4. Solo modo create: crear el contenedor si falta.
+      #    container-rm usa Azure Resource Manager (management plane),
+      #    no la autenticación de datos que probaremos más abajo.
       - name: Create state container if missing
         if: inputs.mode == 'create'
         shell: bash
@@ -93,7 +133,6 @@ jobs:
             echo "State container already exists. No changes."
           elif [ "$EXISTS" = "false" ]; then
             echo "Creating state container..."
-
             az storage container-rm create \
               --storage-account "$STORAGE_ACCOUNT" \
               --resource-group "$RESOURCE_GROUP" \
@@ -105,6 +144,8 @@ jobs:
             exit 1
           fi
 
+      # 5. En AMBOS modos: validar la configuración real de la cuenta.
+      #    jq -e devuelve error si alguna condición es falsa.
       - name: Verify storage account security
         shell: bash
         run: |
@@ -128,6 +169,7 @@ jobs:
 
           echo "Storage account security verified."
 
+      # 6. En AMBOS modos: comprobar que el contenedor existe y es privado.
       - name: Verify state container
         shell: bash
         run: |
@@ -145,4 +187,38 @@ jobs:
           ' container.json > /dev/null
 
           echo "State container verified."
+
+      # 7. NUEVO | RBAC: comprobar el permiso de datos en el ámbito exacto.
+      #    Contributor sobre el Resource Group NO equivale a permisos de blobs.
+      #    Este paso NO concede roles: falla si falta la asignación esperada.
+      - name: Verify OIDC identity has blob data role
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          CONTAINER_SCOPE="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Storage/storageAccounts/$STORAGE_ACCOUNT/blobServices/default/containers/$STORAGE_CONTAINER"
+
+          if ! az role assignment list --assignee "$AZURE_CLIENT_ID" --scope "$CONTAINER_SCOPE" --include-inherited --output json | jq -e --arg scope "$CONTAINER_SCOPE" '[.[] | select(.roleDefinitionName == "Storage Blob Data Contributor" and .scope == $scope)] | length > 0' > /dev/null; then
+            echo "::error::Missing Storage Blob Data Contributor assigned directly on $CONTAINER_SCOPE"
+            exit 1
+          fi
+
+          echo "RBAC verified: Storage Blob Data Contributor on tfstate container."
+
+      # 8. NUEVO | Prueba real del DATA PLANE con el token de Entra ID.
+      #    --auth-mode login obliga a usar la identidad; no usa account keys.
+      #    Listar como máximo un blob NO modifica el estado de Terraform.
+      #    Si RBAC todavía se está propagando, puede fallar temporalmente.
+      - name: Verify blob access with Microsoft Entra ID
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! az storage blob list --account-name "$STORAGE_ACCOUNT" --container-name "$STORAGE_CONTAINER" --auth-mode login --num-results 1 --output none; then
+            echo "::error::Could not list blobs using Entra ID. Check RBAC propagation and storage network access."
+            exit 1
+          fi
+
+          echo "Blob data-plane access verified with Microsoft Entra ID."
           echo "Bootstrap verification passed."
