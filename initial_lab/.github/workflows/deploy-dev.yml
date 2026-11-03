@@ -1,0 +1,64 @@
+name: CD · Deploy development with OIDC
+
+# Lecciones 22 y 23. Requiere configurar la identidad federada, los roles,
+# variables del repositorio y Environment 'development' ANTES de ejecutarlo.
+on:
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: 'GHCR image by digest (ghcr.io/owner/repo@sha256:...)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    environment: development
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate requested image format
+        env:
+          IMAGE: ${{ inputs.image_ref }}
+        shell: bash
+        run: |
+          if [[ ! "$IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$ ]]; then
+            echo 'Expected an immutable GHCR image digest'; exit 1
+          fi
+          EXPECTED_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}@sha256:"
+          if [[ "$IMAGE" != "$EXPECTED_PREFIX"* ]]; then
+            echo 'Image must be published from this same repository'; exit 1
+          fi
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Update Container App image
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image_ref }}
+          APP: ${{ vars.AZURE_CONTAINER_APP_NAME }}
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          az extension add --name containerapp --upgrade --yes
+          az containerapp update --name "$APP" --resource-group "$RG" --image "$IMAGE"
+      - name: Smoke test
+        shell: bash
+        env:
+          APP: ${{ vars.AZURE_CONTAINER_APP_NAME }}
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          FQDN="$(az containerapp show --name "$APP" --resource-group "$RG" --query 'properties.configuration.ingress.fqdn' -o tsv)"
+          if [[ -z "$FQDN" ]]; then echo 'Missing Container App FQDN'; exit 1; fi
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error "https://${FQDN}/health"; then
+              echo "Smoke test OK (attempt $attempt)"; exit 0
+            fi
+            sleep 10
+          done
+          echo 'Smoke test failed'; exit 1
