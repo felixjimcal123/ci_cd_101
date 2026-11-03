@@ -1,0 +1,31 @@
+
+name: Azure Bootstrap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  verify:
+    name: Verify Azure bootstrap
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Login to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: b65d15f8-013f-44bc-b6e7-7496f438d55c
+          tenant-id: 9cf44897-4a11-44b4-9d6a-e96e5ce78034
+          subscription-id: ece1eb3a-d7e4-4691-a1ee-f88ed7111f23
+
+      - name: Verify resource group
+        run: az group show --name rg-rindus-tfstate --query "{name:name,state:properties.provisioningState}" -o table
+
+      - name: Verify storage account
+        run: az storage account show --name strindustfedbb8fbb --resource-group rg-rindus-tfstate --query "{name:name,location:location,state:provisioningState,sharedKey:allowSharedKeyAccess,publicBlobs:allowBlobPublicAccess}" -o table
+
+      - name: Verify state container
+        run: az storage container-rm show --storage-account strindustfedbb8fbb --resource-group rg-rindus-tfstate --name tfstate --query "{name:name,publicAccess:properties.publicAccess}" -o json
