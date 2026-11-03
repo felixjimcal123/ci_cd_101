@@ -15,4 +15,8 @@ terraform {
 
 provider "azurerm" {
   features {}
+  # Los Resource Providers se registran por separado,
+  # con una identidad autorizada a nivel de suscripción.
+  # La pipeline de despliegue conserva permisos limitados al RG.
+  resource_provider_registrations = "none"
 }
