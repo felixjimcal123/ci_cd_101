@@ -1,0 +1,5 @@
+# Copia como terraform.tfvars (ignorado por git) y personaliza.
+resource_group_name = "rg-roadlab-dev"
+location            = "westeurope"
+name_prefix         = "roadlab-UNIQUE"
+container_image     = "ghcr.io/YOUR-OWNER/YOUR-REPO@sha256:REPLACE_WITH_REAL_DIGEST"

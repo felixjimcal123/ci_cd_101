@@ -1,0 +1,31 @@
+name: IaC · Static validation
+
+# Solo validacion sin credenciales privilegiadas. Plan/apply llegan en las clases 22-23.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/terraform-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.10.5'
+      - name: Format
+        run: terraform fmt -check -recursive infra
+      - name: Init without Azure backend
+        working-directory: infra
+        run: terraform init -backend=false -input=false
+      - name: Validate
+        working-directory: infra
+        run: terraform validate -no-color
+      # Checkov se integrara tras verificar que las policies son pertinentes.
