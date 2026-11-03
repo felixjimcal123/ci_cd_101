@@ -74,7 +74,9 @@ jobs:
     name: Terraform ${{ inputs.operation }} (OIDC)
     # Para apply, GitHub exige aprobación SI se configuran reviewers en este entorno.
     # La protección NO se activa por el simple hecho de declarar environment.
-    environment: ${{ inputs.operation == 'apply' && 'rindus-dev-deploy' || 'rindus-dev-plan' }}
+    # plan conserva el subject OIDC ligado a main; apply usa un entorno protegido.
+    # Para apply hay que registrar el subject environment:rindus-dev-deploy en Entra.
+    environment: ${{ inputs.operation == 'apply' && 'rindus-dev-deploy' || '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
