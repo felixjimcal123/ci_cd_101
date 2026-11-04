@@ -1,22 +1,31 @@
+# Workflow de pruebas de otro proyecto del repositorio (03-app-dotnet).
+# No sustituye a los tests de initial_lab ejecutados por container.yml.
 name: Tests xUnit
 
+# Se ejecuta al abrir o actualizar una pull request, sin filtro de rama.
 on:
   pull_request:
 
+# Solo necesita leer el contenido del repositorio.
 permissions:
   contents: read
 
+# El check generado por este job se llama "test".
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # Descarga el código de la revisión de la PR.
       - name: Descargar código
         uses: actions/checkout@v4
+      # Instala el SDK .NET 6 requerido por este proyecto antiguo.
       - name: Instalar .NET 6
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '6.0.x'
+      # Descarga los paquetes NuGet del proyecto de pruebas.
       - name: Restaurar dependencias
         run: dotnet restore 03-app-dotnet/tests/App.Tests/App.Tests.csproj
+      # Ejecuta los tests; un fallo deja el job en rojo.
       - name: Ejecutar tests xUnit
         run: dotnet test 03-app-dotnet/tests/App.Tests/App.Tests.csproj --no-restore --configuration Release

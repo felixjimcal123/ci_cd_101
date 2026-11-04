@@ -21,6 +21,7 @@
 #       backend "azurerm" {}
 # =============================================================================
 
+# Este workflow administra infraestructura, no la versión de imagen desplegada por CI/CD.
 name: Terraform Plan / Apply (OIDC)
 
 # Manual y explícito: no planificamos ni desplegamos en cada push.
@@ -146,6 +147,7 @@ jobs:
       # 8. Plan para ambas operaciones: revisión previa y archivo binario para apply.
       #    -lock-timeout evita fallos por bloqueos transitorios.
       #    -out conserva el plan solo en este runner; NO se sube como artifact.
+      # El archivo tfplan se genera y se consume dentro de la misma ejecución.
       - name: Plan application infrastructure
         run: |
           set -euo pipefail
@@ -168,6 +170,7 @@ jobs:
       #     pública generada por Terraform. La ruta / podría no existir en la API;
       #     si devuelve 404, habrá que usar un endpoint real (p.ej. /health).
       #     Esto NO sustituye pruebas funcionales ni verifica el contrato de API.
+      # Comprueba disponibilidad de /health; no valida toda la funcionalidad.
       - name: Smoke test public API URL
         if: inputs.operation == 'apply'
         run: |
