@@ -21,6 +21,7 @@
 #   Nunca se elimina el backend ni se sustituye un recurso existente.
 # ============================================================================
 
+# Este workflow es independiente del despliegue de la aplicación.
 name: Azure Bootstrap
 
 # Solo ejecución manual: evita crear recursos accidentalmente en cada push.
@@ -210,6 +211,7 @@ jobs:
       #    --auth-mode login obliga a usar la identidad; no usa account keys.
       #    Listar como máximo un blob NO modifica el estado de Terraform.
       #    Si RBAC todavía se está propagando, puede fallar temporalmente.
+      # Esta lectura comprueba permisos efectivos; no modifica el estado remoto.
       - name: Verify blob access with Microsoft Entra ID
         shell: bash
         run: |

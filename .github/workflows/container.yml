@@ -1,5 +1,8 @@
+# CI de la API del laboratorio: valida cambios y construye su imagen Docker.
 name: Container CI
 
+# Se ejecuta en PR hacia main y en push a main, solo si cambian las rutas indicadas.
+# Atención: un check fallido no bloquea el merge si las reglas de GitHub no se aplican.
 on:
   pull_request:
     branches: [main]
@@ -12,32 +15,41 @@ on:
       - 'initial_lab/**'
       - '.github/workflows/container.yml'
 
+# Permisos por defecto del workflow: lectura del repositorio.
 permissions:
   contents: read
 
+# El job "container" es el status check que seleccionamos en el ruleset.
 jobs:
   container:
     runs-on: ubuntu-latest
 
+    # El job necesita publicar paquetes en GHCR al hacer push.
+    # En PR, el paso de publicación está desactivado; este permiso podría restringirse más.
     permissions:
       contents: read
       packages: write
 
     steps:
+      # Descarga el commit que se va a validar.
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Instala el SDK necesario para compilar y ejecutar los tests.
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
 
+      # Puerta de calidad: si falla, los siguientes pasos no se ejecutan.
       - name: Test
         run: dotnet test initial_lab/tests/Integration.Api.Tests/Integration.Api.Tests.csproj -c Release
 
+      # Prepara el motor de construcción de imágenes Docker.
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Autenticación al registro solo para push; nunca para una PR.
       - name: Login to GHCR
         if: github.event_name == 'push'
         uses: docker/login-action@v3
@@ -46,6 +58,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # En PR construye sin publicar; en push a main construye y publica.
+      # La etiqueta por commit identifica el origen, pero no sustituye al digest inmutable.
       - name: Build and optionally push
         uses: docker/build-push-action@v6
         with:
