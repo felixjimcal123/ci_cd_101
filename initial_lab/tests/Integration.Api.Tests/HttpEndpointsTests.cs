@@ -17,7 +17,9 @@ public class HttpEndpointsTests : IClassFixture<WebApplicationFactory<Program>>
         var result = await _client.GetAsync("/health");
         Assert.Equal(HttpStatusCode.OK, result.StatusCode);
         var json = await result.Content.ReadFromJsonAsync<HealthResponse>();
-        Assert.Equal("healthy", json?.Status);
+		
+        // S1: fallo deliberado para verificar que la CI rechaza una prueba incorrecta.
+		Assert.Equal("unhealthy", json?.Status);
     }
 
     [Fact]
