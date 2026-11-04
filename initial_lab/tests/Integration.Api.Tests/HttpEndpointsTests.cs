@@ -17,7 +17,7 @@ public class HttpEndpointsTests : IClassFixture<WebApplicationFactory<Program>>
         var result = await _client.GetAsync("/health");
         Assert.Equal(HttpStatusCode.OK, result.StatusCode);
         var json = await result.Content.ReadFromJsonAsync<HealthResponse>();
-        Assert.Equal("healthy", json?.Status);
+		Assert.Equal("healthy", json?.Status);
     }
 
     [Fact]
