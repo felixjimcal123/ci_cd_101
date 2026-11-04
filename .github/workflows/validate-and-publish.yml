@@ -1,4 +1,3 @@
-
 # =============================================================================
 # RINDUS ROAD | Misión 01 | CI + CD automática con aprobación
 # =============================================================================
@@ -11,7 +10,7 @@
 # La imagen se transfiere mediante outputs, nunca mediante latest.
 # =============================================================================
 
-name: Container CI
+name: Application CI/CD
 
 on:
   # El check obligatorio debe ejecutarse en todas las PR a main.
@@ -23,23 +22,23 @@ on:
     branches: [main]
     paths:
       - 'initial_lab/**'
-      - '.github/workflows/container.yml'
+      - '.github/workflows/validate-and-publish.yml'
       - '.github/workflows/deploy.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: container-ci-${{ github.ref }}
+  group: application-ci-cd-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  container:
-    name: container
+  validate-and-publish:
+    name: Validate and Publish Artifact
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    # El digest se transmite al job deploy.
+    # El digest se transmite al job de despliegue.
     outputs:
       digest: ${{ steps.build.outputs.digest }}
 
@@ -91,10 +90,10 @@ jobs:
           echo "Digest: $DIGEST" >> "$GITHUB_STEP_SUMMARY"
 
   # Este job solo existe para pushes a main.
-  # needs garantiza que CI haya terminado correctamente.
-  deploy:
-    name: Deploy approved image
-    needs: container
+  # needs garantiza que la validación y publicación hayan terminado correctamente.
+  deploy-approved-artifact:
+    name: Deploy Approved Artifact
+    needs: validate-and-publish
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -114,7 +113,7 @@ jobs:
       RESOURCE_GROUP: rg-rindus-app-dev
       CONTAINER_APP: roadlab-api-dev
       IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
-      IMAGE_DIGEST: ${{ needs.container.outputs.digest }}
+      IMAGE_DIGEST: ${{ needs.validate-and-publish.outputs.digest }}
 
     steps:
       # 1. Recibir y validar el digest producido por ESTE build.
