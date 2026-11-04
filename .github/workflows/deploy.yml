@@ -1,0 +1,300 @@
+
+# =============================================================================
+# RINDUS ROAD | Misión 01 | CD protegida para Azure Container Apps
+# =============================================================================
+# Flujo:
+#   1. Validar rama y digest.
+#   2. Verificar que la imagen procede de una CI exitosa en main.
+#   3. Solicitar aprobación del Environment.
+#   4. Autenticarse en Azure mediante OIDC.
+#   5. Registrar imagen y revisión anteriores.
+#   6. Desplegar la imagen inmutable.
+#   7. Esperar a que la nueva revisión esté preparada.
+#   8. Verificar salud y contrato HTTP.
+#
+# No ejecuta Terraform ni recrea infraestructura.
+# No realiza rollback automático: eso se demostrará en S2.
+#
+# Precondiciones:
+#   - Variables: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID.
+#   - Environment rindus-dev-deploy con Required reviewers.
+#   - Credencial federada de Entra para dicho Environment.
+#   - Azure RBAC permite actualizar el Container App.
+#   - Azure Container Apps puede descargar imágenes de GHCR.
+# =============================================================================
+
+name: Deploy Container App (OIDC)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "Digest de la imagen aprobada: sha256:..."
+        required: true
+        type: string
+      source_sha:
+        description: "Commit SHA de main que publicó la imagen"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: container-app-dev-deploy
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: rg-rindus-app-dev
+  CONTAINER_APP: roadlab-api-dev
+  IMAGE_REPOSITORY: ghcr.io/felixjimcal123/ci_cd_101
+
+jobs:
+  verify:
+    name: Verify CI provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    outputs:
+      image: ${{ steps.validate.outputs.image }}
+
+    steps:
+      - name: Validate branch and inputs
+        id: validate
+        shell: bash
+        env:
+          INPUT_DIGEST: ${{ inputs.image_digest }}
+          INPUT_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Solo se permiten despliegues desde main."
+            exit 1
+          fi
+
+          if [[ ! "$INPUT_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Digest SHA256 inválido."
+            exit 1
+          fi
+
+          if [[ ! "$INPUT_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::Commit SHA inválido."
+            exit 1
+          fi
+
+          IMAGE="$IMAGE_REPOSITORY@$INPUT_DIGEST"
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_SHA=$INPUT_SHA" >> "$GITHUB_ENV"
+
+      # Verificar que existe una ejecución CI exitosa para el commit indicado.
+      # No se aceptan ejecuciones de PR ni de ramas distintas de main.
+      - name: Verify successful Container CI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          RUNS="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/container.yml/runs" \
+            -f head_sha="$SOURCE_SHA" \
+            -f branch="main" \
+            -f event="push" \
+            -f status="success" \
+            -f per_page="100" \
+            --method GET)"
+
+          COUNT="$(jq '.workflow_runs | length' <<< "$RUNS")"
+
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "::error::No existe una ejecución Container CI exitosa para $SOURCE_SHA."
+            exit 1
+          fi
+
+          echo "CI verified for commit $SOURCE_SHA"
+
+      # Comprobar que la etiqueta del commit resuelve al digest solicitado.
+      # Se consulta GHCR, no se asume que cualquier digest sea válido.
+      - name: Verify GHCR image digest
+        shell: bash
+        env:
+          INPUT_DIGEST: ${{ inputs.image_digest }}
+          INPUT_SHA: ${{ inputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "$GH_TOKEN" | docker login ghcr.io \
+            -u "$GITHUB_ACTOR" --password-stdin
+
+          TAG="$IMAGE_REPOSITORY:$INPUT_SHA"
+
+          ACTUAL_DIGEST="$(docker buildx imagetools inspect "$TAG" \
+            --format '{{.Manifest.Digest}}')"
+
+          if [[ "$ACTUAL_DIGEST" != "$INPUT_DIGEST" ]]; then
+            echo "::error::El digest no coincide con la imagen publicada por CI."
+            echo "Expected: $INPUT_DIGEST"
+            echo "Actual:   $ACTUAL_DIGEST"
+            exit 1
+          fi
+
+          echo "GHCR digest verified: $ACTUAL_DIGEST"
+
+  deploy:
+    name: Deploy approved image
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # GitHub debe exigir aprobación antes de iniciar este job.
+    environment: rindus-dev-deploy
+
+    steps:
+      # 1. Autenticación OIDC con credenciales efímeras.
+      - name: Login to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # 2. Registrar el estado anterior para auditoría y recuperación.
+      - name: Record previous deployment
+        shell: bash
+        env:
+          IMAGE: ${{ needs.verify.outputs.image }}
+        run: |
+          set -euo pipefail
+
+          PREVIOUS_IMAGE="$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query 'properties.template.containers[0].image' -o tsv)"
+
+          PREVIOUS_REVISION="$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query 'properties.latestReadyRevisionName' -o tsv)"
+
+          if [[ -z "$PREVIOUS_IMAGE" || -z "$PREVIOUS_REVISION" ]]; then
+            echo "::error::No se pudo determinar el despliegue anterior."
+            exit 1
+          fi
+
+          echo "PREVIOUS_IMAGE=$PREVIOUS_IMAGE" >> "$GITHUB_ENV"
+          echo "PREVIOUS_REVISION=$PREVIOUS_REVISION" >> "$GITHUB_ENV"
+
+          {
+            echo "## Azure Container Apps deployment"
+            echo "Previous image: \`$PREVIOUS_IMAGE\`"
+            echo "Previous revision: \`$PREVIOUS_REVISION\`"
+            echo "Requested image: \`$IMAGE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 3. Actualizar exclusivamente la imagen de la aplicación existente.
+      - name: Deploy immutable image
+        shell: bash
+        env:
+          IMAGE: ${{ needs.verify.outputs.image }}
+        run: |
+          set -euo pipefail
+
+          az containerapp update \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$IMAGE" \
+            --output none
+
+      # 4. Esperar a que Azure prepare una revisión nueva.
+      #    Evita considerar exitoso un simple cambio de configuración.
+      - name: Wait for new ready revision
+        shell: bash
+        env:
+          IMAGE: ${{ needs.verify.outputs.image }}
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..24}; do
+            STATE="$(az containerapp show \
+              --name "$CONTAINER_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --query '{
+                image:properties.template.containers[0].image,
+                latest:properties.latestRevisionName,
+                ready:properties.latestReadyRevisionName
+              }' -o json)"
+
+            ACTUAL_IMAGE="$(jq -r '.image // empty' <<< "$STATE")"
+            LATEST="$(jq -r '.latest // empty' <<< "$STATE")"
+            READY="$(jq -r '.ready // empty' <<< "$STATE")"
+
+            if [[ "$ACTUAL_IMAGE" == "$IMAGE" &&
+                  -n "$LATEST" &&
+                  "$LATEST" != "$PREVIOUS_REVISION" &&
+                  "$LATEST" == "$READY" ]]; then
+
+              echo "REVISION=$READY" >> "$GITHUB_ENV"
+              echo "New ready revision: $READY"
+              exit 0
+            fi
+
+            echo "Waiting for revision ($attempt/24): latest=$LATEST ready=$READY"
+            sleep 10
+          done
+
+          echo "::error::La nueva revisión no quedó preparada."
+          exit 1
+
+      # 5. Verificar la API pública tras preparar la nueva revisión.
+      - name: Verify HTTP contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FQDN="$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query 'properties.configuration.ingress.fqdn' -o tsv)"
+
+          BASE_URL="https://$FQDN"
+
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error \
+              --max-time 15 "$BASE_URL/health" |
+              jq -e '.status == "healthy"' > /dev/null; then
+              echo "Health check passed."
+              break
+            fi
+
+            if [[ "$attempt" -eq 12 ]]; then
+              echo "::error::Health check failed."
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          # Contrato funcional conocido de la API.
+          curl --fail --silent --show-error \
+            --max-time 15 "$BASE_URL/api/articles/42" |
+            jq -e '.id == 42 and .priceEur == 7.90' > /dev/null
+
+          HTTP_404="$(curl --silent --output /dev/null \
+            --write-out '%{http_code}' \
+            --max-time 15 "$BASE_URL/api/articles/999")"
+
+          if [[ "$HTTP_404" != "404" ]]; then
+            echo "::error::Contrato HTTP inválido: artículo desconocido."
+            exit 1
+          fi
+
+          {
+            echo "New revision: \`$REVISION\`"
+            echo "Health check: passed"
+            echo "API contract: passed"
+          } >> "$GITHUB_STEP_SUMMARY"
