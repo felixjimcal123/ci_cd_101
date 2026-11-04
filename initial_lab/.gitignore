@@ -1,14 +1,43 @@
+# ==========================================
+# .NET — Archivos generados
+# ==========================================
+
 **/bin/
 **/obj/
+
+# Archivos temporales de compilación y pruebas
+*.user
+*.suo
+*.cache
+TestResults/
+**/TestResults/
+
+# Cobertura de pruebas
+coverage/
+coverage.cobertura.xml
+*.coverage
+*.coveragexml
+
+# ==========================================
+# IDE
+# ==========================================
+
 .vs/
 .idea/
 .vscode/
+
+# ==========================================
+# Terraform — Estado y archivos locales
+# ==========================================
+
 **/.terraform/
 *.tfstate
 *.tfstate.*
 *.tfplan
-*.tfplan.*
-**/terraform.tfvars
-**/*.tfvars.local
-out/
-.DS_Store
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+
+# NO ignorar .terraform.lock.hcl:
+# debe versionarse para fijar proveedores.
