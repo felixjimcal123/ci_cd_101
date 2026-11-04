@@ -1,15 +1,24 @@
-# CI de la API del laboratorio: valida cambios y construye su imagen Docker.
+
+# =============================================================================
+# RINDUS ROAD | Misión 01 | CI + CD automática con aprobación
+# =============================================================================
+# PR:
+#   Tests + Docker build, sin publicar ni desplegar.
+#
+# Push a main:
+#   Tests + Build + Push GHCR -> digest -> aprobación -> Azure -> contrato.
+#
+# La imagen se transfiere mediante outputs, nunca mediante latest.
+# =============================================================================
+
 name: Container CI
 
-# Se ejecuta en PR hacia main y en push a main, solo si cambian las rutas indicadas.
-# Atención: un check fallido no bloquea el merge si las reglas de GitHub no se aplican.
 on:
+  # El check obligatorio debe ejecutarse en todas las PR a main.
   pull_request:
     branches: [main]
-    paths:
-      - 'initial_lab/**'
-      - '.github/workflows/container.yml'
-      - '.github/workflows/deploy.yml'
+
+  # Publicar una nueva imagen cuando cambie la aplicación o sus workflows.
   push:
     branches: [main]
     paths:
@@ -17,41 +26,43 @@ on:
       - '.github/workflows/container.yml'
       - '.github/workflows/deploy.yml'
 
-# Permisos por defecto del workflow: lectura del repositorio.
 permissions:
   contents: read
 
-# El job "container" es el status check que seleccionamos en el ruleset.
+concurrency:
+  group: container-ci-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   container:
+    name: container
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
-    # El job necesita publicar paquetes en GHCR al hacer push.
-    # En PR, el paso de publicación está desactivado; este permiso podría restringirse más.
+    # El digest se transmite al job deploy.
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
     permissions:
       contents: read
       packages: write
 
     steps:
-      # Descarga el commit que se va a validar.
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Instala el SDK necesario para compilar y ejecutar los tests.
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
 
-      # Puerta de calidad: si falla, los siguientes pasos no se ejecutan.
       - name: Test
         run: dotnet test initial_lab/tests/Integration.Api.Tests/Integration.Api.Tests.csproj -c Release
 
-      # Prepara el motor de construcción de imágenes Docker.
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Autenticación al registro solo para push; nunca para una PR.
+      # En una PR no se publica ninguna imagen.
       - name: Login to GHCR
         if: github.event_name == 'push'
         uses: docker/login-action@v3
@@ -60,12 +71,190 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # En PR construye sin publicar; en push a main construye y publica.
-      # La etiqueta por commit identifica el origen, pero no sustituye al digest inmutable.
       - name: Build and optionally push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ./initial_lab
           file: ./initial_lab/Dockerfile
           push: ${{ github.event_name == 'push' }}
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      - name: Record published digest
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "Published digest: $DIGEST"
+          echo "Digest: $DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  # Este job solo existe para pushes a main.
+  # needs garantiza que CI haya terminado correctamente.
+  deploy:
+    name: Deploy approved image
+    needs: container
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      id-token: write
+
+    # GitHub detiene el job hasta recibir la aprobación configurada.
+    environment: rindus-dev-deploy
+
+    concurrency:
+      group: container-app-dev-deploy
+      cancel-in-progress: false
+
+    env:
+      RESOURCE_GROUP: rg-rindus-app-dev
+      CONTAINER_APP: roadlab-api-dev
+      IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+      IMAGE_DIGEST: ${{ needs.container.outputs.digest }}
+
+    steps:
+      # 1. Recibir y validar el digest producido por ESTE build.
+      - name: Resolve immutable image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+
+          IMAGE="$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+          echo "Image approved for deployment: $IMAGE"
+
+      # 2. Autenticación efímera mediante OIDC.
+      - name: Login to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # 3. Guardar imagen y revisión anteriores.
+      - name: Record previous deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PREVIOUS_IMAGE="$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query 'properties.template.containers[0].image' -o tsv)"
+
+          PREVIOUS_REVISION="$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query 'properties.latestReadyRevisionName' -o tsv)"
+
+          [[ -n "$PREVIOUS_IMAGE" && -n "$PREVIOUS_REVISION" ]]
+
+          echo "PREVIOUS_IMAGE=$PREVIOUS_IMAGE" >> "$GITHUB_ENV"
+          echo "PREVIOUS_REVISION=$PREVIOUS_REVISION" >> "$GITHUB_ENV"
+
+          {
+            echo "### Deployment"
+            echo "Previous image: \`$PREVIOUS_IMAGE\`"
+            echo "Previous revision: \`$PREVIOUS_REVISION\`"
+            echo "New image: \`$IMAGE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 4. Actualizar el Container App existente, sin Terraform.
+      - name: Deploy immutable image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az containerapp update \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$IMAGE" \
+            --output none
+
+      # 5. Esperar a que la nueva revisión esté preparada.
+      - name: Wait for new ready revision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..24}; do
+            STATE="$(az containerapp show \
+              --name "$CONTAINER_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --query '{
+                image:properties.template.containers[0].image,
+                latest:properties.latestRevisionName,
+                ready:properties.latestReadyRevisionName
+              }' -o json)"
+
+            ACTUAL_IMAGE="$(jq -r '.image // empty' <<< "$STATE")"
+            LATEST="$(jq -r '.latest // empty' <<< "$STATE")"
+            READY="$(jq -r '.ready // empty' <<< "$STATE")"
+
+            if [[ "$ACTUAL_IMAGE" == "$IMAGE" &&
+                  -n "$LATEST" &&
+                  "$LATEST" != "$PREVIOUS_REVISION" &&
+                  "$LATEST" == "$READY" ]]; then
+              echo "REVISION=$READY" >> "$GITHUB_ENV"
+              echo "New ready revision: $READY"
+              exit 0
+            fi
+
+            echo "Waiting ($attempt/24): latest=$LATEST ready=$READY"
+            sleep 10
+          done
+
+          echo "::error::New revision was not ready."
+          exit 1
+
+      # 6. Verificar salud y contrato funcional.
+      - name: Verify HTTP contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FQDN="$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query 'properties.configuration.ingress.fqdn' -o tsv)"
+
+          BASE_URL="https://$FQDN"
+
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error \
+              --max-time 15 "$BASE_URL/health" |
+              jq -e '.status == "healthy"' > /dev/null; then
+              echo "Health check passed."
+              break
+            fi
+
+            if [[ "$attempt" -eq 12 ]]; then
+              echo "::error::Health check failed."
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          curl --fail --silent --show-error \
+            --max-time 15 "$BASE_URL/api/articles/42" |
+            jq -e '.id == 42 and .priceEur == 7.90' > /dev/null
+
+          HTTP_404="$(curl --silent --output /dev/null \
+            --write-out '%{http_code}' \
+            --max-time 15 "$BASE_URL/api/articles/999")"
+
+          [[ "$HTTP_404" == "404" ]]
+
+          {
+            echo "New revision: \`$REVISION\`"
+            echo "Health check: passed"
+            echo "API contract: passed"
+          } >> "$GITHUB_STEP_SUMMARY"
