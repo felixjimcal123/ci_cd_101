@@ -9,11 +9,13 @@ on:
     paths:
       - 'initial_lab/**'
       - '.github/workflows/container.yml'
+      - '.github/workflows/deploy.yml'
   push:
     branches: [main]
     paths:
       - 'initial_lab/**'
       - '.github/workflows/container.yml'
+      - '.github/workflows/deploy.yml'
 
 # Permisos por defecto del workflow: lectura del repositorio.
 permissions:
