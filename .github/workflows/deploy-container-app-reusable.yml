@@ -1,0 +1,174 @@
+# RINDUS ROAD | M01 S3 | ÚNICA implementación de CD.
+# Dos callers: CI automática y recuperación manual.
+# El Environment protege el job ANTES de que Azure reciba un despliegue.
+name: Reusable - Deploy Container App
+
+on:
+  workflow_call:
+    inputs:
+      image_digest:
+        description: "Imagen GHCR inmutable que el caller ha autorizado"
+        required: true
+        type: string
+
+# El caller también debe conceder id-token: write: el reusable no puede elevarlo.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy approved image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Aprobación y OIDC federado dependen de ESTE Environment.
+    environment: rindus-dev-deploy
+    # Serialización en el job que realmente modifica Azure.
+    concurrency:
+      group: container-app-dev-deploy
+      cancel-in-progress: false
+    env:
+      RESOURCE_GROUP: rg-rindus-app-dev
+      CONTAINER_APP: roadlab-api-dev
+      IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+      IMAGE_DIGEST: ${{ inputs.image_digest }}
+
+    steps:
+      # 1. Convertir el digest en una referencia inmutable, nunca usar latest.
+      - name: Resolve immutable image
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          IMAGE="$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "Image approved for deployment: $IMAGE"
+
+      # 2. Autenticación efímera mediante OIDC.
+      - name: Login to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # 3. Guardar imagen y revisión anteriores.
+      - name: Record previous deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PREVIOUS_IMAGE="$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query 'properties.template.containers[0].image' -o tsv)"
+
+          PREVIOUS_REVISION="$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query 'properties.latestReadyRevisionName' -o tsv)"
+
+          [[ -n "$PREVIOUS_IMAGE" && -n "$PREVIOUS_REVISION" ]]
+
+          echo "PREVIOUS_IMAGE=$PREVIOUS_IMAGE" >> "$GITHUB_ENV"
+          echo "PREVIOUS_REVISION=$PREVIOUS_REVISION" >> "$GITHUB_ENV"
+
+          {
+            echo "### Deployment"
+            echo "Previous image: \`$PREVIOUS_IMAGE\`"
+            echo "Previous revision: \`$PREVIOUS_REVISION\`"
+            echo "New image: \`$IMAGE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 4. Actualizar el Container App existente, sin Terraform.
+      - name: Deploy immutable image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az containerapp update \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$IMAGE" \
+            --output none
+
+      # 5. Esperar a que la nueva revisión esté preparada.
+      - name: Wait for new ready revision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..24}; do
+            STATE="$(az containerapp show \
+              --name "$CONTAINER_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --query '{
+                image:properties.template.containers[0].image,
+                latest:properties.latestRevisionName,
+                ready:properties.latestReadyRevisionName
+              }' -o json)"
+
+            ACTUAL_IMAGE="$(jq -r '.image // empty' <<< "$STATE")"
+            LATEST="$(jq -r '.latest // empty' <<< "$STATE")"
+            READY="$(jq -r '.ready // empty' <<< "$STATE")"
+
+            if [[ "$ACTUAL_IMAGE" == "$IMAGE" &&
+                  -n "$LATEST" &&
+                  "$LATEST" != "$PREVIOUS_REVISION" &&
+                  "$LATEST" == "$READY" ]]; then
+              echo "REVISION=$READY" >> "$GITHUB_ENV"
+              echo "New ready revision: $READY"
+              exit 0
+            fi
+
+            echo "Waiting ($attempt/24): latest=$LATEST ready=$READY"
+            sleep 10
+          done
+
+          echo "::error::New revision was not ready."
+          exit 1
+
+      # 6. Verificar salud y contrato funcional.
+      - name: Verify HTTP contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FQDN="$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query 'properties.configuration.ingress.fqdn' -o tsv)"
+
+          BASE_URL="https://$FQDN"
+
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error \
+              --max-time 15 "$BASE_URL/health" |
+              jq -e '.status == "healthy"' > /dev/null; then
+              echo "Health check passed."
+              break
+            fi
+
+            if [[ "$attempt" -eq 12 ]]; then
+              echo "::error::Health check failed."
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          curl --fail --silent --show-error \
+            --max-time 15 "$BASE_URL/api/articles/42" |
+            jq -e '.id == 42 and .priceEur == 7.90' > /dev/null
+
+          HTTP_404="$(curl --silent --output /dev/null \
+            --write-out '%{http_code}' \
+            --max-time 15 "$BASE_URL/api/articles/999")"
+
+          [[ "$HTTP_404" == "404" ]]
+
+          {
+            echo "New revision: \`$REVISION\`"
+            echo "Health check: passed"
+            echo "API contract: passed"
+          } >> "$GITHUB_STEP_SUMMARY"
