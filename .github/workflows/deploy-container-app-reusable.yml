@@ -1,3 +1,4 @@
+
 # RINDUS ROAD | M01 S3 | ÚNICA implementación de CD.
 # Dos callers: CI automática y recuperación manual.
 # El Environment protege el job ANTES de desplegar en Azure.
@@ -21,12 +22,15 @@ jobs:
     name: Deploy approved image
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     # Aprobación y OIDC federado dependen de este Environment.
     environment: rindus-dev-deploy
+
     # Serialización en el job que realmente modifica Azure.
     concurrency:
       group: container-app-dev-deploy
       cancel-in-progress: false
+
     env:
       RESOURCE_GROUP: rg-rindus-app-dev
       CONTAINER_APP: roadlab-api-dev
@@ -39,7 +43,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+
           IMAGE="$IMAGE_REPOSITORY@$IMAGE_DIGEST"
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "Image approved for deployment: $IMAGE"
@@ -92,8 +98,9 @@ jobs:
             --image "$IMAGE" \
             --output none
 
-      # 5. Esperar a que la nueva revisión esté preparada.
-      - name: Wait for new ready revision
+      # 5. Esperar a que la revisión esté preparada.
+      # Permite reutilizar una revisión existente (despliegue idempotente).
+      - name: Wait for ready revision
         shell: bash
         run: |
           set -euo pipefail
@@ -114,10 +121,9 @@ jobs:
 
             if [[ "$ACTUAL_IMAGE" == "$IMAGE" &&
                   -n "$LATEST" &&
-                  "$LATEST" != "$PREVIOUS_REVISION" &&
                   "$LATEST" == "$READY" ]]; then
               echo "REVISION=$READY" >> "$GITHUB_ENV"
-              echo "New ready revision: $READY"
+              echo "Ready revision: $READY"
               exit 0
             fi
 
@@ -125,7 +131,7 @@ jobs:
             sleep 10
           done
 
-          echo "::error::New revision was not ready."
+          echo "::error::Target revision was not ready."
           exit 1
 
       # 6. Verificar salud y contrato funcional.
