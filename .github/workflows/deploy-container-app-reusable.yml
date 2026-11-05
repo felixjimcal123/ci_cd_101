@@ -92,9 +92,8 @@ jobs:
             --image "$IMAGE" \
             --output none
 
-      # 5. Aceptar una revisión nueva o la existente si ya usa el digest solicitado.
-      # Repetir el mismo despliegue no obliga a Azure a crear otra revisión.
-      - name: Wait for ready revision
+      # 5. Esperar a que la nueva revisión esté preparada.
+      - name: Wait for new ready revision
         shell: bash
         run: |
           set -euo pipefail
@@ -115,9 +114,10 @@ jobs:
 
             if [[ "$ACTUAL_IMAGE" == "$IMAGE" &&
                   -n "$LATEST" &&
+                  "$LATEST" != "$PREVIOUS_REVISION" &&
                   "$LATEST" == "$READY" ]]; then
               echo "REVISION=$READY" >> "$GITHUB_ENV"
-              echo "Ready revision: $READY"
+              echo "New ready revision: $READY"
               exit 0
             fi
 
@@ -125,10 +125,10 @@ jobs:
             sleep 10
           done
 
-          echo "::error::Target revision was not ready."
+          echo "::error::New revision was not ready."
           exit 1
 
-      # 6. Verificar salud y contrato funcional de la API desplegada.
+      # 6. Verificar salud y contrato funcional.
       - name: Verify HTTP contract
         shell: bash
         run: |
