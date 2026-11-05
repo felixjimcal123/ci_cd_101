@@ -100,7 +100,7 @@ jobs:
           set -euo pipefail
 
           RUNS="$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/container.yml/runs" \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/validate-and-publish.yml/runs" \
             -f head_sha="$SOURCE_SHA" \
             -f branch="main" \
             -f event="push" \
