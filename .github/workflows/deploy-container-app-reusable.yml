@@ -1,35 +1,40 @@
 # RINDUS ROAD | M01 S3 | ÚNICA implementación de CD.
 # Dos callers: CI automática y recuperación manual.
-# El Environment protege el job antes de desplegar en Azure.
+# El Environment protege el job ANTES de desplegar en Azure.
 name: Reusable - Deploy Container App
-'on':
+
+on:
   workflow_call:
     inputs:
       image_digest:
-        description: Imagen GHCR inmutable que el caller ha autorizado
+        description: "Imagen GHCR inmutable que el caller ha autorizado"
         required: true
         type: string
+
+# El caller también debe conceder id-token: write: el reusable no puede elevarlo.
 permissions:
   contents: read
   id-token: write
+
 jobs:
   deploy:
     name: Deploy approved image
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # La aprobación y el OIDC federado dependen de este Environment.
+    # Aprobación y OIDC federado dependen de este Environment.
     environment: rindus-dev-deploy
-    # Serializar las operaciones que modifican Azure.
+    # Serialización en el job que realmente modifica Azure.
     concurrency:
       group: container-app-dev-deploy
       cancel-in-progress: false
     env:
       RESOURCE_GROUP: rg-rindus-app-dev
       CONTAINER_APP: roadlab-api-dev
-      IMAGE_REPOSITORY: 'ghcr.io/${{ github.repository }}'
-      IMAGE_DIGEST: '${{ inputs.image_digest }}'
+      IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+      IMAGE_DIGEST: ${{ inputs.image_digest }}
+
     steps:
-      # 1. Construir referencia inmutable a partir del digest.
+      # 1. Construir una referencia inmutable, nunca usar latest.
       - name: Resolve immutable image
         shell: bash
         run: |
@@ -38,14 +43,16 @@ jobs:
           IMAGE="$IMAGE_REPOSITORY@$IMAGE_DIGEST"
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "Image approved for deployment: $IMAGE"
-      # 2. Autenticación efímera con OIDC.
+
+      # 2. Autenticación efímera mediante OIDC.
       - name: Login to Azure with OIDC
         uses: azure/login@v2
         with:
-          client-id: '${{ vars.AZURE_CLIENT_ID }}'
-          tenant-id: '${{ vars.AZURE_TENANT_ID }}'
-          subscription-id: '${{ vars.AZURE_SUBSCRIPTION_ID }}'
-      # 3. Registrar estado previo para trazabilidad.
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # 3. Guardar imagen y revisión anteriores para trazabilidad.
       - name: Record previous deployment
         shell: bash
         run: |
@@ -70,9 +77,10 @@ jobs:
             echo "### Deployment"
             echo "Previous image: \`$PREVIOUS_IMAGE\`"
             echo "Previous revision: \`$PREVIOUS_REVISION\`"
-            echo "New image: \`$IMAGE\`"
+            echo "Target image: \`$IMAGE\`"
           } >> "$GITHUB_STEP_SUMMARY"
-      # 4. Actualizar Container App sin modificar Terraform.
+
+      # 4. Actualizar el Container App existente, sin modificar Terraform.
       - name: Deploy immutable image
         shell: bash
         run: |
@@ -83,7 +91,10 @@ jobs:
             --resource-group "$RESOURCE_GROUP" \
             --image "$IMAGE" \
             --output none
-      - name: Wait for new ready revision
+
+      # 5. Aceptar una revisión nueva o la existente si ya usa el digest solicitado.
+      # Repetir el mismo despliegue no obliga a Azure a crear otra revisión.
+      - name: Wait for ready revision
         shell: bash
         run: |
           set -euo pipefail
@@ -103,8 +114,8 @@ jobs:
             READY="$(jq -r '.ready // empty' <<< "$STATE")"
 
             if [[ "$ACTUAL_IMAGE" == "$IMAGE" &&
-                   -n "$LATEST" &&
-                   "$LATEST" == "$READY" ]]; then
+                  -n "$LATEST" &&
+                  "$LATEST" == "$READY" ]]; then
               echo "REVISION=$READY" >> "$GITHUB_ENV"
               echo "Ready revision: $READY"
               exit 0
@@ -114,9 +125,10 @@ jobs:
             sleep 10
           done
 
-          echo "::error::New revision was not ready."
+          echo "::error::Target revision was not ready."
           exit 1
-      # 6. Verificar salud y contrato funcional.
+
+      # 6. Verificar salud y contrato funcional de la API desplegada.
       - name: Verify HTTP contract
         shell: bash
         run: |
